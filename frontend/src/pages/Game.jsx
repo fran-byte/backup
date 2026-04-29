@@ -50,8 +50,10 @@ function Game() {
       return null;
     }
   });
-    const [roomId] = useState(() => storedRoom.id || "solo-table");
-    const roleStorageKey = useMemo(() => {
+
+  const [roomId] = useState(() => storedRoom.id || "solo-table");
+
+  const roleStorageKey = useMemo(() => {
     const tempUser = JSON.parse(localStorage.getItem("user") || "{}");
     const userId = tempUser?.id || "guest";
     return `blackjack_role_${roomId}_${userId}`;
@@ -60,6 +62,12 @@ function Game() {
   const [tableLabel] = useState(storedRoom.name || "Blackjack Table");
   const [gameState, setGameState] = useState(null);
   const [myId, setMyId] = useState("");
+
+  // ─── FIX 1 ───────────────────────────────────────────────────────────────────
+  // Keep myRole in a ref so the socket effect can read the latest value without
+  // adding it to the dependency array.  Adding myRole as a dep caused the effect
+  // to tear-down and re-run every time join_result fired setMyRole(), which
+  // triggered a second join_game emit → double game_update → flicker.
   const [myRole, setMyRole] = useState(() => {
     try {
       return sessionStorage.getItem(roleStorageKey) || "player";
@@ -67,6 +75,10 @@ function Game() {
       return "player";
     }
   });
+  const myRoleRef = useRef(myRole);
+  // keep ref in sync with state without adding it as an effect dep
+  myRoleRef.current = myRole;
+  // ─────────────────────────────────────────────────────────────────────────────
 
   const [selectedBet, setSelectedBet] = useState(25);
   const [isDragOverBetZone, setIsDragOverBetZone] = useState(false);
@@ -98,6 +110,18 @@ function Game() {
   const lastProcessedRoundRef = useRef("");
   const previousDealerCountRef = useRef(0);
   const previousPlayerCountsRef = useRef({});
+
+  // ─── FIX 3 ───────────────────────────────────────────────────────────────────
+  // When the player switches to a different table (roomId changes), reset all
+  // game-state and animation refs so stale data from the previous table never
+  // bleeds into the new table's render.
+  useEffect(() => {
+    setGameState(null);
+    lastProcessedRoundRef.current = "";
+    previousDealerCountRef.current = 0;
+    previousPlayerCountsRef.current = {};
+  }, [roomId]);
+  // ─────────────────────────────────────────────────────────────────────────────
 
   const syncBalance = (newBalance) => {
     const numericBalance = Number(newBalance ?? 0);
@@ -228,8 +252,12 @@ function Game() {
     const onConnect = () => {
       setMyId(authUser.id);
 
+      // ─── FIX 1 (continued) ────────────────────────────────────────────────────
+      // Read role from the ref (always up-to-date) instead of from the closed-over
+      // state value, so we never need myRole in the dep array.
       const persistedRole =
-        sessionStorage.getItem(roleStorageKey) || myRole || "player";
+        sessionStorage.getItem(roleStorageKey) || myRoleRef.current || "player";
+      // ─────────────────────────────────────────────────────────────────────────
 
       socket.emit("join_game", {
         roomId,
@@ -242,13 +270,22 @@ function Game() {
     const onJoinResult = (payload) => {
       console.log("join_result:", payload);
       const nextRole = payload?.role || "player";
+      // Update both ref and state; updating the ref does NOT re-trigger this effect.
+      myRoleRef.current = nextRole;
       setMyRole(nextRole);
       sessionStorage.setItem(roleStorageKey, nextRole);
     };
 
+    // ─── FIX 2 ───────────────────────────────────────────────────────────────
+    // Guard against stale game_update events that arrive after the player has
+    // already left this room (race condition: round-end event in-flight while
+    // navigating to a new table).  If the server includes a roomId in the
+    // state payload, discard updates that don't match the current room.
     const onGameUpdate = (state) => {
+      if (state?.roomId && state.roomId !== roomId) return;
       setGameState(state);
     };
+    // ─────────────────────────────────────────────────────────────────────────
 
     socket.on("connect", onConnect);
     socket.on("join_result", onJoinResult);
@@ -271,7 +308,12 @@ function Game() {
     storedRoom.seats,
     storedRoom.maxPlayers,
     roleStorageKey,
-    myRole,
+    // ─── FIX 1 (continued) ────────────────────────────────────────────────────
+    // myRole intentionally removed from deps.
+    // Adding it caused the effect to re-run on every join_result response,
+    // which re-emitted join_game and produced a second game_update → flicker.
+    // myRole is now accessed via myRoleRef inside the effect instead.
+    // ─────────────────────────────────────────────────────────────────────────
     isSoloTable,
   ]);
 
@@ -1136,16 +1178,15 @@ function Game() {
 
                   if (data.success) {
                     syncBalance(data.balance);
-                    
-                    socket.emit("sync_wallet_balance", {
-                    roomId,
-                    userId: authUser.id,
-                    balance: Number(data.balance),
-                  });
 
-                  setWalletMsg(`Deposited +$${walletAmount}`);
-                }
-                else {
+                    socket.emit("sync_wallet_balance", {
+                      roomId,
+                      userId: authUser.id,
+                      balance: Number(data.balance),
+                    });
+
+                    setWalletMsg(`Deposited +$${walletAmount}`);
+                  } else {
                     setWalletMsg("Error: " + data.message);
                   }
                 }}
@@ -1192,8 +1233,7 @@ function Game() {
                     });
 
                     setWalletMsg(`Withdrawn -$${walletAmount}`);
-                  }
-                  else {
+                  } else {
                     setWalletMsg("Error: " + data.message);
                   }
                 }}
