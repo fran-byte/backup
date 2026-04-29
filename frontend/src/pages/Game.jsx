@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { socket } from "../socket";
-import Card from "../components/Card";
+import Card from "./components/Card";
 import Navbar from "../components/Navbar";
 import Footer from "../components/Footer";
 import "../styles/Game.css";
@@ -78,6 +78,18 @@ function Game() {
   const myRoleRef = useRef(myRole);
   // keep ref in sync with state without adding it as an effect dep
   myRoleRef.current = myRole;
+
+  // ─── FIX 4 ───────────────────────────────────────────────────────────────────
+  // Keep authUser in a ref so the socket effect can read the latest value without
+  // adding the full authUser object to the dependency array.
+  // Problem: setAuthUser() (called by syncBalance / verifyUser) always produces a
+  // new object reference → authUser as a dep re-triggers the effect → second
+  // join_game emitted → duplicate game_update → flicker on every balance refresh.
+  // Solution: depend only on the stable primitive authUser?.id, read the full
+  // object from the ref inside the effect.
+  const authUserRef = useRef(authUser);
+  authUserRef.current = authUser;
+  // ─────────────────────────────────────────────────────────────────────────────
   // ─────────────────────────────────────────────────────────────────────────────
 
   const [selectedBet, setSelectedBet] = useState(25);
@@ -246,46 +258,44 @@ function Game() {
     bootstrapUserData();
   }, [authUser]);
 
+  // Stable primitive dep extracted from authUser object
+  const authUserId = authUser?.id ?? null;
+
   useEffect(() => {
-    if (!authUser?.id) return;
+    if (!authUserId) return;
 
     const onConnect = () => {
-      setMyId(authUser.id);
+      // Read from refs — never from closed-over state — so this handler is
+      // always fresh without requiring the full authUser object as a dep.
+      const currentUser = authUserRef.current;
+      if (!currentUser?.id) return;
 
-      // ─── FIX 1 (continued) ────────────────────────────────────────────────────
-      // Read role from the ref (always up-to-date) instead of from the closed-over
-      // state value, so we never need myRole in the dep array.
+      setMyId(currentUser.id);
+
       const persistedRole =
         sessionStorage.getItem(roleStorageKey) || myRoleRef.current || "player";
-      // ─────────────────────────────────────────────────────────────────────────
 
       socket.emit("join_game", {
         roomId,
-        user: authUser,
+        user: currentUser,
         maxPlayers: Number(storedRoom.seats || storedRoom.maxPlayers || 4),
         preferredRole: isSoloTable ? "player" : persistedRole,
       });
     };
 
     const onJoinResult = (payload) => {
-      console.log("join_result:", payload);
       const nextRole = payload?.role || "player";
-      // Update both ref and state; updating the ref does NOT re-trigger this effect.
       myRoleRef.current = nextRole;
       setMyRole(nextRole);
       sessionStorage.setItem(roleStorageKey, nextRole);
     };
 
-    // ─── FIX 2 ───────────────────────────────────────────────────────────────
-    // Guard against stale game_update events that arrive after the player has
-    // already left this room (race condition: round-end event in-flight while
-    // navigating to a new table).  If the server includes a roomId in the
-    // state payload, discard updates that don't match the current room.
+    // Discard stale game_update events from a previous room (race condition:
+    // round-end broadcast in-flight while the player navigates to a new table).
     const onGameUpdate = (state) => {
       if (state?.roomId && state.roomId !== roomId) return;
       setGameState(state);
     };
-    // ─────────────────────────────────────────────────────────────────────────
 
     socket.on("connect", onConnect);
     socket.on("join_result", onJoinResult);
@@ -298,23 +308,27 @@ function Game() {
     }
 
     return () => {
+      // ─── FIX 5 ─────────────────────────────────────────────────────────────
+      // Notify the server that this player is leaving the room.  Without this
+      // the server keeps the socket subscribed to the old room and continues
+      // broadcasting game_update events for that table — causing the flicker
+      // and desync when the player joins a different table.
+      socket.emit("leave_game", roomId);
+      // ───────────────────────────────────────────────────────────────────────
+
       socket.off("connect", onConnect);
       socket.off("join_result", onJoinResult);
       socket.off("game_update", onGameUpdate);
     };
   }, [
     roomId,
-    authUser,
+    authUserId,         // ← stable primitive; replaces full authUser object
     storedRoom.seats,
     storedRoom.maxPlayers,
     roleStorageKey,
-    // ─── FIX 1 (continued) ────────────────────────────────────────────────────
-    // myRole intentionally removed from deps.
-    // Adding it caused the effect to re-run on every join_result response,
-    // which re-emitted join_game and produced a second game_update → flicker.
-    // myRole is now accessed via myRoleRef inside the effect instead.
-    // ─────────────────────────────────────────────────────────────────────────
     isSoloTable,
+    // myRole intentionally omitted — accessed via myRoleRef inside the effect.
+    // authUser object intentionally omitted — accessed via authUserRef.
   ]);
 
   const fallbackState = {
